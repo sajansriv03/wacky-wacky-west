@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { initializeApp } from 'firebase/app';
-import { getDatabase, ref, onValue, set, update, get, onDisconnect } from 'firebase/database';
+import { getDatabase, ref, onValue, set, update, get, onDisconnect, runTransaction } from 'firebase/database';
 
 // Firebase config - REPLACE WITH YOUR OWN CONFIG
 // For Firebase JS SDK v7.20.0 and later, measurementId is optional
@@ -57,7 +57,7 @@ const normalizeCollection = (collection) => (
   Array.isArray(collection) ? collection.filter(Boolean) : Object.values(collection || {}).filter(Boolean)
 );
 
-const RED_WORKER_IMAGE = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Cdefs%3E%3CradialGradient id='g' cx='35%25' cy='30%25' r='70%25'%3E%3Cstop offset='0%25' stop-color='%23ff6961'/%3E%3Cstop offset='70%25' stop-color='%23d10f0f'/%3E%3Cstop offset='100%25' stop-color='%23a00000'/%3E%3C/radialGradient%3E%3C/defs%3E%3Ccircle cx='50' cy='50' r='48' fill='url(%23g)'/%3E%3Cellipse cx='40' cy='36' rx='12' ry='8' fill='%23ffb3ac' opacity='0.5'/%3E%3C/svg%3E";
+const RED_WORKER_IMAGE = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 576 566'%3E%3Cdefs%3E%3CradialGradient id='g' cx='33%25' cy='34%25' r='72%25'%3E%3Cstop offset='0%25' stop-color='%23ff4a3f'/%3E%3Cstop offset='58%25' stop-color='%23e00707'/%3E%3Cstop offset='100%25' stop-color='%23b40000'/%3E%3C/radialGradient%3E%3C/defs%3E%3Ccircle cx='288' cy='283' r='272' fill='url(%23g)'/%3E%3Cpath d='M89 183c24-38 57-68 110-88 97-35 193-15 266 39' fill='none' stroke='%23ff8a63' stroke-width='21' opacity='.26'/%3E%3Cellipse cx='198' cy='284' rx='57' ry='39' fill='%23ffb09a' opacity='.35'/%3E%3Cellipse cx='244' cy='296' rx='22' ry='16' fill='%23ffb09a' opacity='.4'/%3E%3Cpath d='M182 431c84-16 132-16 216 0' fill='none' stroke='%239a0000' stroke-width='10' opacity='.55'/%3E%3C/svg%3E";
 IMAGES.worker = RED_WORKER_IMAGE;
 
 export default function App() {
@@ -79,6 +79,7 @@ export default function App() {
   
   const boardRef = useRef(null);
   const roomRef = useRef(null);
+  const voteRevealTimerRef = useRef(null);
 
   // Generate or retrieve player ID
   useEffect(() => {
@@ -232,102 +233,22 @@ export default function App() {
 
   const startGame = async () => {
     if (!gameState || gameState.host !== playerId) return;
-    
+
     const numPlayers = gameState.players.length;
     if (numPlayers < 2 || numPlayers > 4) {
       alert('Need 2-4 players to start');
       return;
     }
 
-    // Initialize game state
-    const players = getNormalizedPlayers(gameState.players).map(p => p.name);
-    const board = Array(10).fill(0).map(() => Array(15).fill(0).map(() => ({covered: false})));
-    const workers = {topsy: {c:0, r:0}, road: {c:14, r:0}, river: {c:0, r:9}, turvy: {c:14, r:9}};
-    
-    // Generate tiles with correct types and quantities (matching local version)
-    const all = [];
-    for(let i=0; i<6; i++) all.push({id:`r1-${i}`,type:'Road_1',size:1});
-    for(let i=0; i<6; i++) all.push({id:`r2-${i}`,type:'Road_2',size:2});
-    for(let i=0; i<1; i++) all.push({id:`r3-${i}`,type:'Road_3',size:3});
-    for(let i=0; i<2; i++) all.push({id:`r3t-${i}`,type:'Road_3__type_2_',size:3});
-    for(let i=0; i<6; i++) all.push({id:`ri1-${i}`,type:'River_1',size:1});
-    for(let i=0; i<6; i++) all.push({id:`ri2-${i}`,type:'River_2',size:2});
-    for(let i=0; i<2; i++) all.push({id:`ri3-${i}`,type:'River_3',size:3});
-    for(let i=0; i<1; i++) all.push({id:`ri3t-${i}`,type:'River_3__type_2_',size:3});
-    for(let i=0; i<12; i++) all.push({id:`rr1-${i}`,type:'Railroad_1',size:1});
-    for(let i=0; i<12; i++) all.push({id:`rr2-${i}`,type:'Railroad_2',size:2});
-    for(let i=0; i<3; i++) all.push({id:`rr3-${i}`,type:'Railroad_3',size:3});
-    for(let i=0; i<3; i++) all.push({id:`rr3t-${i}`,type:'Railroad_3__type_2_',size:3});
-    all.sort(() => Math.random() - 0.5);
+    await update(ref(database, `rooms/${roomId}`), createFreshGameState(gameState.players));
+  };
 
-    // Shuffle and assign secret buildings
-    const shuffledBuildings = [...BUILDING_TYPES].sort(() => Math.random() - 0.5);
-    const secretBuildings = {};
-    players.forEach((p, i) => {
-      secretBuildings[p] = shuffledBuildings[i % BUILDING_TYPES.length];
-    });
-
-    // Distribute tiles - group by family and distribute evenly
-    const dealtTiles = {};
-    players.forEach(p => dealtTiles[p] = []);
-    
-    const groupedByFamily = {};
-    all.forEach(tile => {
-      const family = tile.type.replace('__type_2_', '');
-      if (!groupedByFamily[family]) groupedByFamily[family] = [];
-      groupedByFamily[family].push(tile);
-    });
-
-    // For 2 players: use local version's split logic (split families in half, alternate odd tiles)
-    // For 3-4 players: distribute round-robin within each family
-    if (numPlayers === 2) {
-      let oddGoesTo = 0;
-      Object.values(groupedByFamily).forEach(group => {
-        const shuffled = [...group].sort(() => Math.random() - 0.5);
-        const half = Math.floor(shuffled.length / 2);
-        dealtTiles[players[0]].push(...shuffled.slice(0, half));
-        dealtTiles[players[1]].push(...shuffled.slice(half, half * 2));
-        if(shuffled.length % 2 === 1) {
-          dealtTiles[players[oddGoesTo]].push(shuffled[shuffled.length - 1]);
-          oddGoesTo = 1 - oddGoesTo;
-        }
-      });
-    } else {
-      let playerIndex = 0;
-      Object.values(groupedByFamily).forEach(group => {
-        const shuffled = [...group].sort(() => Math.random() - 0.5);
-        shuffled.forEach(tile => {
-          dealtTiles[players[playerIndex]].push(tile);
-          playerIndex = (playerIndex + 1) % numPlayers;
-        });
-      });
-    }
-
-    // Give each player the exact same set of voting cards
-    const votingCards = {};
-    players.forEach(p => {
-      votingCards[p] = ['Yes_1', 'Yes_2', 'Yes_3', 'No_1', 'No_2', 'No_3', 'Wildcard', 'Indifferent'];
-    });
-
-    const scores = {};
-    players.forEach(p => scores[p] = 15);
-
-    await update(ref(database, `rooms/${roomId}`), {
-      started: true,
-      board,
-      workers,
-      tiles: dealtTiles,
-      secretBuildings,
-      votingCards,
-      scores,
-      currentPlayer: 0,
-      placedTiles: [],
-      gameEnded: false,
-      winner: null,
-      pendingVote: null,
-      voteSelections: {},
-      voteSubmitted: {}
-    });
+  const restartGame = async () => {
+    if (!gameState || gameState.host !== playerId) return;
+    await update(ref(database, `rooms/${roomId}`), createFreshGameState(gameState.players));
+    setDragging(null);
+    setValidMoves([]);
+    setPreviewMove(null);
   };
 
   const calcMovesForState = (tile, boardState, workersState, placedTilesState) => {
@@ -393,6 +314,95 @@ export default function App() {
   };
 
   const getNormalizedPlayers = (playersState) => normalizeCollection(playersState);
+
+  const createFreshGameState = (playersState) => {
+    const normalizedPlayers = getNormalizedPlayers(playersState);
+    const numPlayers = normalizedPlayers.length;
+    const players = normalizedPlayers.map(p => p.name);
+    const board = Array(10).fill(0).map(() => Array(15).fill(0).map(() => ({covered: false})));
+    const workers = {topsy: {c:0, r:0}, road: {c:14, r:0}, river: {c:0, r:9}, turvy: {c:14, r:9}};
+
+    const all = [];
+    for(let i=0; i<6; i++) all.push({id:`r1-${i}`,type:'Road_1',size:1});
+    for(let i=0; i<6; i++) all.push({id:`r2-${i}`,type:'Road_2',size:2});
+    for(let i=0; i<1; i++) all.push({id:`r3-${i}`,type:'Road_3',size:3});
+    for(let i=0; i<2; i++) all.push({id:`r3t-${i}`,type:'Road_3__type_2_',size:3});
+    for(let i=0; i<6; i++) all.push({id:`ri1-${i}`,type:'River_1',size:1});
+    for(let i=0; i<6; i++) all.push({id:`ri2-${i}`,type:'River_2',size:2});
+    for(let i=0; i<2; i++) all.push({id:`ri3-${i}`,type:'River_3',size:3});
+    for(let i=0; i<1; i++) all.push({id:`ri3t-${i}`,type:'River_3__type_2_',size:3});
+    for(let i=0; i<12; i++) all.push({id:`rr1-${i}`,type:'Railroad_1',size:1});
+    for(let i=0; i<12; i++) all.push({id:`rr2-${i}`,type:'Railroad_2',size:2});
+    for(let i=0; i<3; i++) all.push({id:`rr3-${i}`,type:'Railroad_3',size:3});
+    for(let i=0; i<3; i++) all.push({id:`rr3t-${i}`,type:'Railroad_3__type_2_',size:3});
+    all.sort(() => Math.random() - 0.5);
+
+    const shuffledBuildings = [...BUILDING_TYPES].sort(() => Math.random() - 0.5);
+    const secretBuildings = {};
+    players.forEach((name, i) => {
+      secretBuildings[name] = shuffledBuildings[i % BUILDING_TYPES.length];
+    });
+
+    const dealtTiles = {};
+    players.forEach(name => dealtTiles[name] = []);
+    const groupedByFamily = {};
+    all.forEach(tile => {
+      const family = tile.type.replace('__type_2_', '');
+      if (!groupedByFamily[family]) groupedByFamily[family] = [];
+      groupedByFamily[family].push(tile);
+    });
+
+    if (numPlayers === 2) {
+      let oddGoesTo = 0;
+      Object.values(groupedByFamily).forEach(group => {
+        const shuffled = [...group].sort(() => Math.random() - 0.5);
+        const half = Math.floor(shuffled.length / 2);
+        dealtTiles[players[0]].push(...shuffled.slice(0, half));
+        dealtTiles[players[1]].push(...shuffled.slice(half, half * 2));
+        if(shuffled.length % 2 === 1) {
+          dealtTiles[players[oddGoesTo]].push(shuffled[shuffled.length - 1]);
+          oddGoesTo = 1 - oddGoesTo;
+        }
+      });
+    } else {
+      let playerIndex = 0;
+      Object.values(groupedByFamily).forEach(group => {
+        const shuffled = [...group].sort(() => Math.random() - 0.5);
+        shuffled.forEach(tile => {
+          dealtTiles[players[playerIndex]].push(tile);
+          playerIndex = (playerIndex + 1) % numPlayers;
+        });
+      });
+    }
+
+    const votingCards = {};
+    players.forEach(name => {
+      votingCards[name] = ['Yes_1', 'Yes_2', 'Yes_3', 'No_1', 'No_2', 'No_3', 'Wildcard', 'Indifferent'];
+    });
+
+    const scores = {};
+    players.forEach(name => scores[name] = 15);
+
+    return {
+      started: true,
+      board,
+      workers,
+      tiles: dealtTiles,
+      secretBuildings,
+      votingCards,
+      scores,
+      currentPlayer: 0,
+      placedTiles: [],
+      gameEnded: false,
+      winner: null,
+      pendingVote: null,
+      voteSelections: {},
+      voteSubmitted: {},
+      voteRevealStartedAt: null,
+      voteResolution: null,
+      lastActionMessage: 'New game started!'
+    };
+  };
 
   const getNextPlayableTurn = (players, currentIndex, tilesState, boardState, workersState, placedTilesState) => {
     for(let offset = 0; offset < players.length; offset++) {
@@ -544,10 +554,19 @@ export default function App() {
     if(!myName) return;
 
     if(card === 'Wildcard') {
-      setWildcardChoice({player: myName, callback: async (choice) => {
-        const current = gameState.voteSelections?.[myName] || [];
+      const current = gameState.voteSelections?.[myName] || [];
+      const currentWildcard = current.find(c => c.startsWith('Wildcard_'));
+      if (currentWildcard) {
         await update(ref(database, `rooms/${roomId}/voteSelections`), {
-          [myName]: [...current, `Wildcard_${choice}`]
+          [myName]: current.filter(c => !c.startsWith('Wildcard_'))
+        });
+        return;
+      }
+
+      setWildcardChoice({player: myName, callback: async (choice) => {
+        const freshCurrent = gameState.voteSelections?.[myName] || [];
+        await update(ref(database, `rooms/${roomId}/voteSelections`), {
+          [myName]: [...freshCurrent.filter(c => !c.startsWith('Wildcard_')), `Wildcard_${choice}`]
         });
         setWildcardChoice(null);
       }});
@@ -574,56 +593,122 @@ export default function App() {
     await update(ref(database, `rooms/${roomId}/voteSubmitted`), {
       [myName]: true
     });
+
+    const roomPath = ref(database, `rooms/${roomId}`);
+    await runTransaction(roomPath, (room) => {
+      if (!room || !room.pendingVote) return room;
+      const playersList = normalizeCollection(room.players).map(p => p.name);
+      const submitted = room.voteSubmitted || {};
+      const everyoneDone = playersList.length > 0 && playersList.every((player) => submitted[player]);
+      if (!everyoneDone || room.voteRevealStartedAt) return room;
+
+      let yesVotes = 0, noVotes = 0;
+      const usedCards = [];
+      Object.entries(room.voteSelections || {}).forEach(([player, cards]) => {
+        cards.forEach((card) => {
+          if(card.startsWith('Yes')) yesVotes += parseInt(card.split('_')[1]);
+          else if(card.startsWith('No')) noVotes += parseInt(card.split('_')[1]);
+          else if(card === 'Wildcard_Yes') yesVotes += 2;
+          else if(card === 'Wildcard_No') noVotes += 2;
+          if(card !== 'Indifferent') usedCards.push({player, card: card.startsWith('Wildcard') ? 'Wildcard' : card});
+        });
+      });
+
+      const votingCards = {...room.votingCards};
+      usedCards.forEach(({player, card}) => {
+        votingCards[player] = (votingCards[player] || []).filter(c => c !== card);
+      });
+
+      room.voteRevealStartedAt = Date.now();
+      room.voteResolution = {
+        yesVotes,
+        noVotes,
+        votePass: yesVotes >= noVotes,
+        votingCards
+      };
+      return room;
+    });
   };
 
-  const handleVote = async () => {
-    const players = getNormalizedPlayers(gameState.players).map(p => p.name);
-    let yesVotes = 0, noVotes = 0;
-    const usedCards = [];
-    
-    Object.entries(gameState.voteSelections || {}).forEach(([player, cards]) => {
-      cards.forEach(card => {
-        if(card.startsWith('Yes')) yesVotes += parseInt(card.split('_')[1]);
-        else if(card.startsWith('No')) noVotes += parseInt(card.split('_')[1]);
-        else if(card === 'Wildcard_Yes') yesVotes += 2;
-        else if(card === 'Wildcard_No') noVotes += 2;
-        if(card !== 'Indifferent') usedCards.push({player, card: card.startsWith('Wildcard') ? 'Wildcard' : card});
-      });
-    });
-    
-    const votePass = yesVotes >= noVotes;
-    const newCards = {...gameState.votingCards};
-    usedCards.forEach(uc => {
-      newCards[uc.player] = newCards[uc.player].filter(c => c !== uc.card);
-    });
+  const processVoteAndFinalize = async () => {
+    await runTransaction(ref(database, `rooms/${roomId}`), (room) => {
+      if (!room || !room.pendingVote || !room.voteResolution) return room;
 
-    if(votePass) {
-      await placeTile(gameState.pendingVote.move, gameState.pendingVote.tile);
-      await update(ref(database, `rooms/${roomId}`), {
-        votingCards: newCards,
-        pendingVote: null,
-        voteSelections: {},
-        voteSubmitted: {}
-      });
-    } else {
-      const playersList = getNormalizedPlayers(gameState.players).map(p => p.name);
-      const turnResult = getNextPlayableTurn(playersList, (gameState.currentPlayer + 1) % playersList.length, gameState.tiles, gameState.board, gameState.workers, normalizeCollection(gameState.placedTiles));
-      const scoresNow = calculateScores(gameState.board, gameState.secretBuildings, playersList);
-      await update(ref(database, `rooms/${roomId}`), {
-        votingCards: newCards,
-        currentPlayer: turnResult.nextPlayerIndex ?? gameState.currentPlayer,
-        gameEnded: !turnResult.hasAnyMoves,
-        winner: !turnResult.hasAnyMoves ? getWinnerName(scoresNow) : null,
-        scores: scoresNow,
-        lastActionMessage: !turnResult.hasAnyMoves
+      const playersList = normalizeCollection(room.players).map(p => p.name);
+      const resolution = room.voteResolution;
+      room.votingCards = resolution.votingCards || room.votingCards;
+
+      if (resolution.votePass) {
+        const move = room.pendingVote.move;
+        const tile = room.pendingVote.tile;
+
+        const nb = room.board.map(r => r.map(c => ({...c})));
+        move.cells.forEach(([c,r]) => { nb[r][c].covered = true; });
+        const currentPlacedTiles = normalizeCollection(room.placedTiles);
+        const newPlacedTiles = [...currentPlacedTiles, {type: tile.type, cells: move.cells, rotation: move.rot, size: tile.size}];
+        const [lc,lr] = move.cells[move.cells.length-1];
+        const nw = {...room.workers};
+        nw[move.track] = {c:lc, r:lr};
+
+        const pn = playersList[room.currentPlayer];
+        const nt = {...room.tiles};
+        nt[pn] = (nt[pn] || []).filter(t => t.id !== tile.id);
+
+        const newScores = calculateScores(nb, room.secretBuildings, playersList);
+        const turnResult = getNextPlayableTurn(playersList, (room.currentPlayer + 1) % playersList.length, nt, nb, nw, newPlacedTiles);
+
+        room.board = nb;
+        room.placedTiles = newPlacedTiles;
+        room.workers = nw;
+        room.tiles = nt;
+        room.scores = newScores;
+
+        if(!turnResult.hasAnyMoves) {
+          room.gameEnded = true;
+          room.winner = getWinnerName(newScores);
+          room.lastActionMessage = 'No players have any legal moves left. Game over!';
+        } else {
+          const previousCurrentPlayer = room.currentPlayer;
+          room.currentPlayer = turnResult.nextPlayerIndex;
+          const skippedCount = (turnResult.nextPlayerIndex - ((previousCurrentPlayer + 1) % playersList.length) + playersList.length) % playersList.length;
+          room.lastActionMessage = skippedCount > 0 ? `${pn} played. ${skippedCount} player(s) had no legal move and were skipped.` : `${pn} played a tile.`;
+        }
+      } else {
+        const turnResult = getNextPlayableTurn(playersList, (room.currentPlayer + 1) % playersList.length, room.tiles, room.board, room.workers, normalizeCollection(room.placedTiles));
+        const scoresNow = calculateScores(room.board, room.secretBuildings, playersList);
+        room.currentPlayer = turnResult.nextPlayerIndex ?? room.currentPlayer;
+        room.gameEnded = !turnResult.hasAnyMoves;
+        room.winner = !turnResult.hasAnyMoves ? getWinnerName(scoresNow) : null;
+        room.scores = scoresNow;
+        room.lastActionMessage = !turnResult.hasAnyMoves
           ? 'Vote failed, and no players have any legal moves left. Game over!'
-          : 'Vote failed. Turn passes to the next player with a legal move.',
-        pendingVote: null,
-        voteSelections: {},
-        voteSubmitted: {}
-      });
-    }
+          : 'Vote failed. Turn passes to the next player with a legal move.';
+      }
+
+      room.pendingVote = null;
+      room.voteSelections = {};
+      room.voteSubmitted = {};
+      room.voteRevealStartedAt = null;
+      room.voteResolution = null;
+      return room;
+    });
   };
+
+  useEffect(() => {
+    if (!gameState?.pendingVote || !gameState?.voteRevealStartedAt) return;
+
+    const elapsed = Date.now() - gameState.voteRevealStartedAt;
+    const delay = Math.max(0, 3000 - elapsed);
+    if (voteRevealTimerRef.current) clearTimeout(voteRevealTimerRef.current);
+
+    voteRevealTimerRef.current = setTimeout(() => {
+      processVoteAndFinalize();
+    }, delay);
+
+    return () => {
+      if (voteRevealTimerRef.current) clearTimeout(voteRevealTimerRef.current);
+    };
+  }, [gameState?.pendingVote, gameState?.voteRevealStartedAt]);
 
   const copyRoomLink = () => {
     const link = `${window.location.origin}${window.location.pathname}?room=${roomId}`;
@@ -718,7 +803,7 @@ export default function App() {
                 <h3 style={{margin:'0 0 10px 0'}}>Players ({gameState?.players?.length || 0}/4):</h3>
                 {gameState?.players?.map((p, i) => (
                   <div key={i} style={{padding:'10px',background:p.connected ? '#e8f5e9' : '#ffebee',borderRadius:'5px',marginBottom:'5px',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-                    <span>{p.name} {p.id === gameState.host && ''}</span>
+                    <span>{p.name} {p.id === gameState.host && <strong title="Host">👑</strong>}</span>
                     <span style={{fontSize:'12px',color:p.connected ? '#4CAF50' : '#f44336'}}>
                       {p.connected ? ' Connected' : ' Disconnected'}
                     </span>
@@ -797,7 +882,7 @@ export default function App() {
       <div style={{marginBottom:'15px',background:'white',padding:'12px 20px',borderRadius:'10px'}}>
         <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',flexWrap:'wrap',gap:'10px'}}>
           <div>
-            <h2 style={{margin:0}}>Wacky West - Room {roomId}</h2>
+            <h2 style={{margin:0}}>Wacky Wacky West - Room {roomId}</h2>
             <div style={{display:'flex',gap:'20px',marginTop:'8px',fontSize:'14px'}}>
               <span>Current Turn: {currentPlayerName}</span>
               <span>Tiles: {(gameState.tiles[currentPlayerName] || []).length}</span>
@@ -876,7 +961,7 @@ export default function App() {
                   />
                 );
               })}
-              {Object.entries(gameState.workers || {}).filter(([, w]) => w && Number.isInteger(w.c) && Number.isInteger(w.r)).map(([n,w]) => <image key={n} x={V[w.c]+20} y={H[w.r]+20} width={V[w.c+1]-V[w.c]-40} height={H[w.r+1]-H[w.r]-40} href={IMAGES.worker} preserveAspectRatio="xMidYMid meet" style={{clipPath:'circle(50% at 50% 50%)'}}/>) }
+              {Object.entries(gameState.workers || {}).filter(([, w]) => w && Number.isInteger(w.c) && Number.isInteger(w.r)).map(([n,w]) => <image key={n} x={V[w.c]+20} y={H[w.r]+20} width={V[w.c+1]-V[w.c]-40} height={H[w.r+1]-H[w.r]-40} href={IMAGES.worker} preserveAspectRatio="xMidYMid meet" style={{}}/>) }
             </svg>
           </div>
         </div>
@@ -914,7 +999,7 @@ export default function App() {
               <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:'8px',alignContent:'start'}}>
                 {(gameState.tiles[selectedPlayerName] || []).map(t => (
                   <div 
-                    key={t.id} 
+                    key={`${selectedPlayerName}-${t.id}`} 
                     draggable={selectedPlayerName === myName && myPlayerIndex === gameState.currentPlayer && !gameState.pendingVote && !gameState.gameEnded} 
                     onDragStart={(e)=>onDragStart(e,t)} 
                     onDrag={onDrag} 
@@ -1029,28 +1114,9 @@ export default function App() {
                   </div>
                 </div>
               ))}
-              {playerId === gameState.host ? (
-                <button 
-                  onClick={handleVote}
-                  style={{
-                    padding:'12px 30px',
-                    fontSize:'18px',
-                    background:'#FFD700',
-                    border:'none',
-                    borderRadius:'10px',
-                    cursor:'pointer',
-                    fontWeight:'bold',
-                    width:'100%',
-                    marginTop:'15px'
-                  }}
-                >
-                  Resolve Vote
-                </button>
-              ) : (
-                <div style={{marginTop:'12px',fontSize:'12px',color:'#555'}}>
-                  Waiting for host to resolve the vote.
-                </div>
-              )}
+              <div style={{marginTop:'12px',fontSize:'12px',color:'#555'}}>
+                Votes revealed. Resolving automatically...
+              </div>
             </>
           )}
         </div>
@@ -1063,10 +1129,18 @@ export default function App() {
             <h1 style={{margin:'0 0 20px 0',color:'#FFD700'}}>Game Over!</h1>
             <h2 style={{margin:'0 0 30px 0'}}>{gameState.winner} Wins!</h2>
             {gameState.lastActionMessage && <div style={{fontSize:'13px',marginBottom:'14px',color:'#555'}}>{gameState.lastActionMessage}</div>}
-            <div style={{marginBottom:'30px',fontSize:'18px',fontWeight:'bold'}}>
+            <div style={{marginBottom:'20px',fontSize:'18px',fontWeight:'bold'}}>
               Your Score: {myName ? (gameState.scores?.[myName] ?? 15) : 15} points
             </div>
-            <button onClick={() => window.location.reload()} style={{padding:'15px 30px',fontSize:'18px',background:'#FFD700',border:'none',borderRadius:'8px',cursor:'pointer',fontWeight:'bold'}}>
+            <div style={{textAlign:'left',marginBottom:'18px',maxHeight:'160px',overflowY:'auto',padding:'10px',border:'1px solid #ddd',borderRadius:'8px'}}>
+              <div style={{fontWeight:'bold',marginBottom:'8px'}}>Final secrets:</div>
+              {players.map(player => (
+                <div key={`final-${player}`} style={{fontSize:'13px',marginBottom:'6px'}}>
+                  {player}: {gameState.secretBuildings[player]?.replace(/_/g,' ')}
+                </div>
+              ))}
+            </div>
+            <button onClick={restartGame} disabled={gameState.host !== playerId} style={{padding:'15px 30px',fontSize:'18px',background:gameState.host === playerId ? '#FFD700' : '#ccc',border:'none',borderRadius:'8px',cursor:gameState.host === playerId ? 'pointer' : 'not-allowed',fontWeight:'bold'}}>
               Play Again
             </button>
           </div>
